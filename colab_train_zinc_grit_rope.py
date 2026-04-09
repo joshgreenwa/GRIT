@@ -215,11 +215,18 @@ INSTALL_STEPS = [
     ("torch-geometric==2.3.1",
      "python -m pip install torch-geometric==2.3.1"),
 
-    # 4. Remaining pure-Python deps. torchmetrics is unpinned (the old 0.9.1
-    #    pin carried the broken metadata). performer-pytorch dropped -- not
-    #    used by the ZINC / GritRoPETransformer path.
-    ("Supporting libs (torchmetrics, ogb, yacs, opt_einsum, tensorboardX, rdkit, lightning)",
-     "python -m pip install torchmetrics ogb yacs opt_einsum tensorboardX rdkit pytorch-lightning"),
+    # 4. Remaining pure-Python deps.
+    #
+    #    CRITICAL: we force-upgrade torchmetrics with `-U` to >=1.0.
+    #    Colab preinstalls torchmetrics==0.9.1 (a 2022 release) which does
+    #    `from pkg_resources import ...`; that resolves to the Debian system
+    #    pkg_resources at /usr/lib/python3/dist-packages/, which hard-codes
+    #    `pkgutil.ImpImporter` -- removed in Python 3.12. Modern torchmetrics
+    #    (>=1.0) dropped pkg_resources entirely, which bypasses the bug.
+    #    Without `-U` pip would say "already satisfied" and keep 0.9.1.
+    ("Supporting libs (torchmetrics>=1.0, ogb, yacs, opt_einsum, tensorboardX, rdkit, lightning)",
+     "python -m pip install -U 'torchmetrics>=1.0' ogb yacs opt_einsum "
+     "tensorboardX rdkit pytorch-lightning"),
 
     # 5. Sanity-check imports, so any version mismatch dies here with a
     #    readable traceback rather than silently breaking main.py.
