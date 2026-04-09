@@ -424,8 +424,26 @@ def run_training(cfg_path: str):
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
 
+    # We run main.py through a tiny shim that monkey-patches torch.load to
+    # default `weights_only=False` before any PyG dataset is touched. This is
+    # needed because PyTorch 2.6 changed the default of `weights_only` from
+    # False to True, but PyG 2.3.1's cached ZINC dataset was pickled with
+    # plain Python objects (torch_geometric.data.data.Data), which the new
+    # safe loader refuses to unpickle. Upgrading PyG would drop graphgym, so
+    # the monkey-patch is the least invasive fix. The patch is safe here
+    # because every dataset we load is downloaded by PyG itself (trusted).
+    shim = (
+        "import torch, sys, runpy;"
+        "_orig_load = torch.load;"
+        "def _patched_load(*a, **k):\n"
+        "    k.setdefault('weights_only', False)\n"
+        "    return _orig_load(*a, **k)\n"
+        "torch.load = _patched_load;"
+        "sys.argv = ['main.py'] + sys.argv[1:];"
+        "runpy.run_path('main.py', run_name='__main__')"
+    )
     cmd = [
-        sys.executable, "-u", "main.py",
+        sys.executable, "-u", "-c", shim,
         "--cfg", cfg_path,
         "seed", str(SEED),
         "dataset.dir", DATA_DIR,
