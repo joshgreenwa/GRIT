@@ -184,13 +184,14 @@ class CustomLogger(Logger):
     def regression(self):
         true, pred = torch.cat(self._true), torch.cat(self._pred)
         reformat = lambda x: round(float(x), cfg.round)
+        mse = mean_squared_error(true, pred)
         return {
             'mae': reformat(mean_absolute_error(true, pred)),
             'r2': reformat(r2_score(true, pred, multioutput='uniform_average')),
             'spearmanr': reformat(eval_spearmanr(true.numpy(),
                                                  pred.numpy())['spearmanr']),
-            'mse': reformat(mean_squared_error(true, pred)),
-            'rmse': reformat(mean_squared_error(true, pred, squared=False)),
+            'mse': reformat(mse),
+            'rmse': reformat(np.sqrt(mse)),
         }
 
     def update_stats(self, true, pred, loss, lr, time_used, params,
