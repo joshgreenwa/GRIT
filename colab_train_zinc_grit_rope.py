@@ -432,16 +432,18 @@ def run_training(cfg_path: str):
     # safe loader refuses to unpickle. Upgrading PyG would drop graphgym, so
     # the monkey-patch is the least invasive fix. The patch is safe here
     # because every dataset we load is downloaded by PyG itself (trusted).
-    shim = (
-        "import torch, sys, runpy;"
-        "_orig_load = torch.load;"
-        "def _patched_load(*a, **k):\n"
-        "    k.setdefault('weights_only', False)\n"
-        "    return _orig_load(*a, **k)\n"
-        "torch.load = _patched_load;"
-        "sys.argv = ['main.py'] + sys.argv[1:];"
-        "runpy.run_path('main.py', run_name='__main__')"
-    )
+    shim = "\n".join([
+        "import runpy",
+        "import sys",
+        "import torch",
+        "_orig_load = torch.load",
+        "def _patched_load(*a, **k):",
+        "    k.setdefault('weights_only', False)",
+        "    return _orig_load(*a, **k)",
+        "torch.load = _patched_load",
+        "sys.argv = ['main.py'] + sys.argv[1:]",
+        "runpy.run_path('main.py', run_name='__main__')",
+    ])
     cmd = [
         sys.executable, "-u", "-c", shim,
         "--cfg", cfg_path,
