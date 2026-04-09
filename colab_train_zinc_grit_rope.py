@@ -3,22 +3,30 @@ Colab driver: train + eval GritRoPETransformer on ZINC (subset, 12k).
 
 Assumptions
 -----------
-- You have uploaded the working folder (the one that contains `grit/` with
-  `main.py`, `configs/`, `grit/` package, etc.) to your Google Drive.
-- You will run this script cell-by-cell (or top-to-bottom) in a Colab notebook.
-- A GPU runtime is selected (Runtime -> Change runtime type -> GPU).
+- You are running this in Google Colab with a GPU runtime
+  (Runtime -> Change runtime type -> GPU).
+- You have a GitHub personal access token stored as a Colab secret named
+  `diss_key` (left sidebar -> key icon -> Add new secret -> name=diss_key,
+  value=<your PAT>, and "Notebook access" enabled).
+- The repo https://github.com/joshgreenwa/GRIT contains this file and the
+  `grit_rope_layer.py` we added.
+- Google Drive is mounted ONLY so that dataset downloads and result
+  checkpoints persist across Colab sessions. If you don't want that, set
+  USE_DRIVE_FOR_PERSISTENCE = False below and everything will live under
+  /content (ephemeral).
 
 What it does
 ------------
-1. Mounts Google Drive and cd's into the working folder.
-2. Installs the pinned dependencies GRIT needs.
-3. Writes a new config YAML that is byte-for-byte the official
+1. (Optionally) mounts Google Drive for dataset + results persistence.
+2. Reads the `diss_key` Colab secret and `git clone`s the repo into /content.
+3. Installs the pinned dependencies GRIT needs.
+4. Writes a new config YAML that is byte-for-byte the official
    `zinc-GRIT-RRWP.yaml` except `gt.layer_type` is swapped to
    `GritRoPETransformer` (and optionally the number of epochs is reduced,
    because 2000 epochs on a free Colab T4 takes ~half a day).
-4. Launches `main.py` with that config as a subprocess and streams its
+5. Launches `main.py` with that config as a subprocess and streams its
    stdout live so you can watch per-epoch train/val/test MAE.
-5. At the end, parses the final results file and prints a tidy summary.
+6. At the end, parses the final results file and prints a tidy summary.
 
 Experimental setup (from `configs/GRIT/zinc-GRIT-RRWP.yaml`, matches Table 2 of
 the GRIT paper for ZINC 12k subset):
@@ -45,18 +53,30 @@ the GRIT paper for ZINC 12k subset):
 # CELL 1 -- User-configurable settings
 # ============================================================================
 
-# Absolute path inside your Google Drive to the folder that contains `main.py`
-# and the `grit/` Python package. Example:
-#     My Drive/GRIT/grit/    <- this folder has main.py, configs/, grit/, ...
-# then set:
-DRIVE_WORK_DIR = "/content/drive/MyDrive/GRIT/grit"
+# GitHub repo to clone. Must contain main.py at its root (alongside configs/
+# and the inner `grit/` Python package, which in turn contains
+# `layer/grit_rope_layer.py`).
+GITHUB_REPO = "joshgreenwa/GRIT"
+GITHUB_BRANCH = "main"  # change if you pushed to a different branch
+SECRET_NAME = "diss_key"  # name of the Colab secret holding your PAT
 
-# Where ZINC will be downloaded to (first run). Keep on Drive so reruns skip
-# the download, or use /content for faster ephemeral storage.
-DATA_DIR = "/content/drive/MyDrive/GRIT/datasets"
+# Where to clone the repo inside Colab (ephemeral, under /content).
+CLONE_DIR = "/content/GRIT"
 
-# Output directory for logs, checkpoints, final metrics.
-OUT_DIR = "/content/drive/MyDrive/GRIT/results_rope_zinc"
+# Persist dataset + results across Colab sessions by storing them in Drive.
+# Set to False for a fully ephemeral run (faster I/O, no Drive mount).
+USE_DRIVE_FOR_PERSISTENCE = True
+
+# Where ZINC will be downloaded to (first run).
+DATA_DIR = (
+    "/content/drive/MyDrive/GRIT/datasets"
+    if USE_DRIVE_FOR_PERSISTENCE else "/content/datasets"
+)
+# Where logs, checkpoints, and final metrics get written.
+OUT_DIR = (
+    "/content/drive/MyDrive/GRIT/results_rope_zinc"
+    if USE_DRIVE_FOR_PERSISTENCE else "/content/results_rope_zinc"
+)
 
 # Random seed -- the paper reports mean over seeds 0..3. Pick one for Colab.
 SEED = 0
@@ -73,15 +93,76 @@ SMOKE_TEST = False
 # head dim, rounded down to even (default).
 D_STRUCT = None  # e.g. 6 for head_dim=8
 
+# Filled in by enter_workdir() once we detect where main.py lives inside the
+# cloned repo. Everything downstream uses this instead of CLONE_DIR directly.
+WORK_DIR = None
+
 
 # ============================================================================
-# CELL 2 -- Mount Google Drive
+# CELL 2 -- (Optional) Mount Google Drive for persistence
 # ============================================================================
 
 def mount_drive():
+    if not USE_DRIVE_FOR_PERSISTENCE:
+        print("[mount] USE_DRIVE_FOR_PERSISTENCE=False -- skipping Drive mount.")
+        return
     from google.colab import drive  # only available inside Colab
     drive.mount("/content/drive")
     print("[mount] Google Drive mounted at /content/drive")
+
+
+# ============================================================================
+# CELL 2b -- Clone the repo using the Colab secret as a PAT
+# ============================================================================
+
+def clone_repo():
+    """git clone https://<token>@github.com/<GITHUB_REPO>.git into CLONE_DIR."""
+    import os
+    import shutil
+    import subprocess
+
+    # Pull the PAT from Colab secrets.
+    try:
+        from google.colab import userdata
+        token = userdata.get(SECRET_NAME)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read Colab secret {SECRET_NAME!r}. In the left sidebar "
+            f"click the key icon, add a secret named {SECRET_NAME!r} with your "
+            "GitHub PAT, and enable notebook access."
+        ) from exc
+    if not token:
+        raise RuntimeError(
+            f"Colab secret {SECRET_NAME!r} is empty. Paste your GitHub PAT into it."
+        )
+
+    # Fresh clone each run so we always pick up the latest commit from the
+    # repo. The PAT lives only in the subprocess env, not in the remote URL
+    # that gets stored in .git/config.
+    if os.path.isdir(CLONE_DIR):
+        print(f"[clone] Removing existing {CLONE_DIR} for a fresh clone ...")
+        shutil.rmtree(CLONE_DIR)
+
+    remote = f"https://{token}@github.com/{GITHUB_REPO}.git"
+    safe_remote = f"https://***@github.com/{GITHUB_REPO}.git"
+    print(f"[clone] git clone --depth 1 -b {GITHUB_BRANCH} {safe_remote} {CLONE_DIR}")
+    proc = subprocess.run(
+        ["git", "clone", "--depth", "1", "-b", GITHUB_BRANCH, remote, CLONE_DIR],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        # Strip the token from any error message before printing.
+        msg = (proc.stdout + "\n" + proc.stderr).replace(token, "***")
+        raise RuntimeError(f"git clone failed:\n{msg}")
+
+    # Scrub the token from the stored remote URL so `git pull` later prompts
+    # rather than silently using the embedded credential.
+    subprocess.run(
+        ["git", "-C", CLONE_DIR, "remote", "set-url", "origin",
+         f"https://github.com/{GITHUB_REPO}.git"],
+        check=True,
+    )
+    print(f"[clone] Clone complete at {CLONE_DIR}")
 
 
 # ============================================================================
@@ -96,42 +177,100 @@ def mount_drive():
 # runtime once. If you hit a `distutils` error on first run, do
 # Runtime -> Restart runtime, then re-run everything from CELL 4 onwards.
 
-INSTALL_COMMANDS = r"""
-set -e
-python -c "import torch; print('[install] torch:', torch.__version__, 'cuda:', torch.version.cuda)"
+# NOTE on the infamous `pkgutil.ImpImporter` error you may have seen:
+# GRIT's README pins setuptools==59.5.0, but that version calls
+# pkgutil.ImpImporter, which was REMOVED in Python 3.12 (Colab's current
+# Python). Any `pip install` step that pulls in a package whose metadata
+# handling routes through pkg_resources from that old setuptools crashes.
+# The fix below is threefold:
+#   1. Upgrade pip/setuptools/wheel as the FIRST step, so every subsequent
+#      pip call uses the modern setuptools that works on Python 3.12.
+#   2. Drop packages we don't actually need for ZINC training
+#      (performer-pytorch) and remove the hard pin on torchmetrics=0.9.1
+#      (a 2022-era package with legacy setup.py metadata that was also
+#      tripping the same error).
+#   3. Stream pip output live instead of capturing it, so if something DOES
+#      fail we see exactly which package and line.
 
-TORCH_VERSION=$(python -c "import torch; print(torch.__version__.split('+')[0])")
-CUDA_VERSION=$(python -c "import torch; v=torch.version.cuda; print('cu'+v.replace('.','')) if v else print('cpu')")
-echo "[install] Resolved torch=$TORCH_VERSION cuda=$CUDA_VERSION"
+# Each entry is ONE pip invocation so we can label progress.
+INSTALL_STEPS = [
+    # 1. Modernise the build toolchain before touching anything else.
+    ("Upgrade pip / setuptools / wheel",
+     "python -m pip install --upgrade pip setuptools wheel"),
 
-pip install -q torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_VERSION}.html
-pip install -q torch-geometric==2.2.0
-pip install -q torchmetrics==0.9.1
-pip install -q ogb
-pip install -q yacs
-pip install -q opt_einsum
-pip install -q tensorboardX
-pip install -q performer-pytorch
-pip install -q rdkit
-pip install -q pytorch-lightning
-pip install -q setuptools==59.5.0
+    # 2. PyG C++ extensions, built against Colab's current torch/cuda.
+    ("torch-scatter + torch-sparse (PyG wheel index)",
+     'python - <<PY\n'
+     'import torch, subprocess, sys\n'
+     'tv = torch.__version__.split("+")[0]\n'
+     'cu = "cu" + torch.version.cuda.replace(".", "") if torch.version.cuda else "cpu"\n'
+     'url = f"https://data.pyg.org/whl/torch-{tv}+{cu}.html"\n'
+     'print("[install] PyG wheel index:", url)\n'
+     'subprocess.check_call([sys.executable, "-m", "pip", "install",\n'
+     '    "torch-scatter", "torch-sparse", "-f", url])\n'
+     'PY'),
 
-echo "[install] Done."
-"""
+    # 3. PyG itself. 2.3.x still has torch_geometric.graphgym (GRIT needs it),
+    #    and installs on Python 3.12. PyG 2.5+ removed graphgym.
+    ("torch-geometric==2.3.1",
+     "python -m pip install torch-geometric==2.3.1"),
+
+    # 4. Remaining pure-Python deps. torchmetrics is unpinned (the old 0.9.1
+    #    pin carried the broken metadata). performer-pytorch dropped -- not
+    #    used by the ZINC / GritRoPETransformer path.
+    ("Supporting libs (torchmetrics, ogb, yacs, opt_einsum, tensorboardX, rdkit, lightning)",
+     "python -m pip install torchmetrics ogb yacs opt_einsum tensorboardX rdkit pytorch-lightning"),
+
+    # 5. Sanity-check imports, so any version mismatch dies here with a
+    #    readable traceback rather than silently breaking main.py.
+    ("Import sanity check",
+     'python - <<PY\n'
+     'import sys\n'
+     'print("[install] python", sys.version)\n'
+     'import torch; print("[install] torch", torch.__version__, "cuda", torch.version.cuda)\n'
+     'import torch_scatter, torch_sparse\n'
+     'print("[install] torch_scatter", torch_scatter.__version__)\n'
+     'print("[install] torch_sparse", torch_sparse.__version__)\n'
+     'import torch_geometric; print("[install] torch_geometric", torch_geometric.__version__)\n'
+     'from torch_geometric.graphgym.config import cfg\n'
+     'print("[install] torch_geometric.graphgym OK")\n'
+     'import yacs, ogb, torchmetrics, tensorboardX, opt_einsum\n'
+     'print("[install] supporting libs OK")\n'
+     'PY'),
+]
 
 
 def install_deps():
+    """Run each install step with live-streamed output."""
     import subprocess
-    print("[install] Installing GRIT dependencies (this takes ~2 min) ...")
-    proc = subprocess.run(
-        ["bash", "-lc", INSTALL_COMMANDS],
-        capture_output=True, text=True,
-    )
-    print(proc.stdout)
-    if proc.returncode != 0:
-        print("[install] STDERR:\n" + proc.stderr)
-        raise RuntimeError("Dependency installation failed. See stderr above.")
-    print("[install] Finished installing dependencies.")
+    import sys
+
+    print("[install] Installing GRIT dependencies "
+          "(each step streams live; takes ~2-3 min total)")
+    print("=" * 78)
+    for label, cmd in INSTALL_STEPS:
+        print(f"\n[install] >>> {label}")
+        print(f"[install]     $ {cmd.splitlines()[0]}"
+              + (" ..." if "\n" in cmd else ""))
+        proc = subprocess.Popen(
+            ["bash", "-lc", cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            text=True,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write("    " + line)
+            sys.stdout.flush()
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"[install] Step failed ({label!r}) with exit code "
+                f"{proc.returncode}. Scroll up for the full log."
+            )
+    print("=" * 78)
+    print("[install] All dependency steps completed successfully.")
 
 
 # ============================================================================
@@ -139,28 +278,52 @@ def install_deps():
 # ============================================================================
 
 def enter_workdir():
+    """Locate main.py inside the cloned repo, chdir there, sanity-check."""
     import os
     import sys
-    if not os.path.isdir(DRIVE_WORK_DIR):
+    global WORK_DIR
+
+    # main.py may live at the repo root or inside a top-level subfolder
+    # (e.g. GRIT/grit/main.py). Walk up to 2 levels to find it.
+    candidates = [CLONE_DIR]
+    try:
+        for entry in sorted(os.listdir(CLONE_DIR)):
+            sub = os.path.join(CLONE_DIR, entry)
+            if os.path.isdir(sub):
+                candidates.append(sub)
+    except FileNotFoundError:
         raise FileNotFoundError(
-            f"DRIVE_WORK_DIR={DRIVE_WORK_DIR!r} does not exist. "
-            "Edit CELL 1 to point at the folder in Drive that contains main.py."
+            f"CLONE_DIR={CLONE_DIR!r} does not exist -- did clone_repo() run?"
         )
-    os.chdir(DRIVE_WORK_DIR)
-    if DRIVE_WORK_DIR not in sys.path:
-        sys.path.insert(0, DRIVE_WORK_DIR)
+
+    found = None
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "main.py")):
+            found = c
+            break
+    if found is None:
+        raise FileNotFoundError(
+            f"Could not find main.py in {CLONE_DIR} or any of its immediate "
+            f"subdirectories. Contents: {os.listdir(CLONE_DIR)}"
+        )
+
+    WORK_DIR = found
+    os.chdir(WORK_DIR)
+    if WORK_DIR not in sys.path:
+        sys.path.insert(0, WORK_DIR)
     print(f"[workdir] cwd = {os.getcwd()}")
 
-    # Sanity: must contain main.py, grit/ package, configs/GRIT/
+    # Sanity: must contain main.py, grit/ package, configs/GRIT/, rope layer
     needed = ["main.py", "grit", "configs/GRIT/zinc-GRIT-RRWP.yaml",
               "grit/layer/grit_rope_layer.py"]
     missing = [p for p in needed if not os.path.exists(p)]
     if missing:
         raise FileNotFoundError(
-            "The following required paths are missing in DRIVE_WORK_DIR:\n  "
+            "The following required paths are missing in WORK_DIR:\n  "
             + "\n  ".join(missing)
-            + "\nMake sure you uploaded the full GRIT working folder, including "
-              "the new grit_rope_layer.py we added."
+            + "\nThe clone is incomplete, on the wrong branch, or is missing "
+              "the grit_rope_layer.py commit. Check GITHUB_BRANCH and that "
+              "grit/layer/grit_rope_layer.py is committed on that branch."
         )
     print("[workdir] Repo layout looks correct.")
 
@@ -270,7 +433,7 @@ def run_training(cfg_path: str):
     t0 = time.time()
     proc = subprocess.Popen(
         cmd,
-        cwd=DRIVE_WORK_DIR,
+        cwd=WORK_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
@@ -336,11 +499,12 @@ def summarise_results():
 def main():
     import os
     mount_drive()
+    clone_repo()
     enter_workdir()
     install_deps()
 
     cfg_path = os.path.join(
-        DRIVE_WORK_DIR, "configs", "GRIT", "zinc-GRIT-RRWP-rope.yaml"
+        WORK_DIR, "configs", "GRIT", "zinc-GRIT-RRWP-rope.yaml"
     )
     build_config(cfg_path)
     run_training(cfg_path)
@@ -350,8 +514,9 @@ def main():
 
 
 if __name__ == "__main__":
-    # In Colab you can either (a) paste each CELL block into its own cell and
-    # run them in order, or (b) put this whole file on Drive and just do
-    #     !python /content/drive/MyDrive/GRIT/grit/colab_train_zinc_grit_rope.py
-    # from a single Colab cell after you've already mounted Drive.
+    # In Colab, after setting the `diss_key` secret and selecting a GPU
+    # runtime, you can either:
+    #   (a) paste each CELL block into its own cell and run them in order, or
+    #   (b) upload only THIS file to /content and run it in one cell:
+    #         !python /content/colab_train_zinc_grit_rope.py
     main()
