@@ -1,5 +1,18 @@
 """
-Colab driver: train + eval GritRoPETransformer on ZINC (subset, 12k).
+Colab driver: train + eval GRIT-RoPE variants on ZINC (subset, 12k).
+
+Supported model variants (set MODEL_VARIANT below):
+
+    "rope"        GritRoPETransformer
+                  RoPE dot-product attention + GRIT-style edge stream update.
+
+    "rope_pair"   GritRoPEPairTransformer
+                  RoPE attention + AF2-style symmetric pair-MLP edge update:
+                  e_ij^{l+1} = e_ij^l + MLP(LN([h_i+h_j || h_i*h_j || e_ij]))
+
+    "rope_noedge" GritRoPENoEdgeTransformer
+                  Pure RoPE attention with NO edge representation at all.
+                  All structural info flows through the RoPE rotation angles.
 
 Assumptions
 -----------
@@ -9,7 +22,7 @@ Assumptions
   `diss_key` (left sidebar -> key icon -> Add new secret -> name=diss_key,
   value=<your PAT>, and "Notebook access" enabled).
 - The repo https://github.com/joshgreenwa/GRIT contains this file and the
-  `grit_rope_layer.py` we added.
+  variant layer files under grit/layer/.
 - Google Drive is mounted ONLY so that dataset downloads and result
   checkpoints persist across Colab sessions. If you don't want that, set
   USE_DRIVE_FOR_PERSISTENCE = False below and everything will live under
@@ -20,10 +33,8 @@ What it does
 1. (Optionally) mounts Google Drive for dataset + results persistence.
 2. Reads the `diss_key` Colab secret and `git clone`s the repo into /content.
 3. Installs the pinned dependencies GRIT needs.
-4. Writes a new config YAML that is byte-for-byte the official
-   `zinc-GRIT-RRWP.yaml` except `gt.layer_type` is swapped to
-   `GritRoPETransformer` (and optionally the number of epochs is reduced,
-   because 2000 epochs on a free Colab T4 takes ~half a day).
+4. Writes a new config YAML derived from the official `zinc-GRIT-RRWP.yaml`
+   with gt.layer_type and model.type set to the chosen variant.
 5. Launches `main.py` with that config as a subprocess and streams its
    stdout live so you can watch per-epoch train/val/test MAE.
 6. At the end, parses the final results file and prints a tidy summary.
@@ -53,6 +64,30 @@ the GRIT paper for ZINC 12k subset):
 # CELL 1 -- User-configurable settings
 # ============================================================================
 
+# ---- Model variant selector ----
+# Choose one of:
+#   "rope"        - RoPE attention + GRIT-style edge stream  (GritRoPETransformer)
+#   "rope_pair"   - RoPE attention + AF2 pair-MLP edge update (GritRoPEPairTransformer)
+#   "rope_noedge" - Pure RoPE attention, no edges at all      (GritRoPENoEdgeTransformer)
+MODEL_VARIANT = "rope"
+
+# ---- Pair-MLP settings (only used when MODEL_VARIANT == "rope_pair") ----
+# MLP architecture: 3d -> hidden_mult*d -> d.  Use 1 for no expansion (3d->d->d).
+PAIR_MLP_HIDDEN_MULT = 2
+# Share one MLP across ALL layers (AF2 style) vs one MLP per layer.
+PAIR_MLP_SHARE_ACROSS_LAYERS = False
+# MLP dropout (independent of the main attn/layer dropout).
+PAIR_MLP_DROPOUT = 0.0
+# MLP activation: "gelu" or "relu".
+PAIR_MLP_ACT = "gelu"
+
+# ---- Variant name -> internal class name mapping (do not edit) ----
+_VARIANT_MAP = {
+    "rope":        "GritRoPETransformer",
+    "rope_pair":   "GritRoPEPairTransformer",
+    "rope_noedge": "GritRoPENoEdgeTransformer",
+}
+
 # GitHub repo to clone. Must contain main.py at its root (alongside configs/
 # and the inner `grit/` Python package, which in turn contains
 # `layer/grit_rope_layer.py`).
@@ -73,9 +108,10 @@ DATA_DIR = (
     if USE_DRIVE_FOR_PERSISTENCE else "/content/datasets"
 )
 # Where logs, checkpoints, and final metrics get written.
+# Includes the variant name so different runs don't overwrite each other.
 OUT_DIR = (
-    "/content/drive/MyDrive/GRIT/results_rope_zinc"
-    if USE_DRIVE_FOR_PERSISTENCE else "/content/results_rope_zinc"
+    f"/content/drive/MyDrive/GRIT/results_{MODEL_VARIANT}_zinc"
+    if USE_DRIVE_FOR_PERSISTENCE else f"/content/results_{MODEL_VARIANT}_zinc"
 )
 
 # Random seed -- the paper reports mean over seeds 0..3. Pick one for Colab.
@@ -340,8 +376,16 @@ def enter_workdir():
 # ============================================================================
 
 def build_config(cfg_out_path: str):
-    """Write a new YAML cfg that swaps layer_type -> GritRoPETransformer."""
+    """Write a new YAML config derived from zinc-GRIT-RRWP.yaml for the
+    selected MODEL_VARIANT."""
     import os
+
+    if MODEL_VARIANT not in _VARIANT_MAP:
+        raise ValueError(
+            f"Unknown MODEL_VARIANT={MODEL_VARIANT!r}. "
+            f"Choose one of: {list(_VARIANT_MAP.keys())}"
+        )
+    class_name = _VARIANT_MAP[MODEL_VARIANT]
 
     base_path = "configs/GRIT/zinc-GRIT-RRWP.yaml"
     with open(base_path, "r") as f:
@@ -352,31 +396,50 @@ def build_config(cfg_out_path: str):
     # preserved byte-for-byte for every field we don't touch.
     out_lines = []
     in_attn_block = False
-    attn_block_indent = None
     d_struct_injected = False
 
     for line in base_yaml.splitlines():
         stripped = line.rstrip()
+
+        # Swap layer_type to the chosen variant.
         if stripped.startswith("  layer_type: GritTransformer"):
-            out_lines.append("  layer_type: GritRoPETransformer")
+            out_lines.append(f"  layer_type: {class_name}")
             continue
-        # Track the attn: block so we can inject d_struct inside it.
+
+        # Swap model.type to the chosen variant.
+        if stripped.startswith("  type: GritTransformer"):
+            out_lines.append(f"  type: {class_name}")
+            continue
+
+        # Track the attn: block so we can inject d_struct and edge_mlp inside it.
         if stripped.startswith("  attn:"):
             in_attn_block = True
-            attn_block_indent = "    "
             out_lines.append(line)
             continue
         if in_attn_block and line and not line.startswith("    ") and not line.startswith("\t"):
-            # Exited the attn: block without injecting d_struct yet.
+            # Exiting the attn: block -- inject d_struct + edge_mlp before we leave.
             if D_STRUCT is not None and not d_struct_injected:
                 out_lines.append(f"    d_struct: {int(D_STRUCT)}")
                 d_struct_injected = True
+            if MODEL_VARIANT == "rope_pair":
+                out_lines.append("    edge_mlp:")
+                out_lines.append(f"      hidden_mult: {PAIR_MLP_HIDDEN_MULT}")
+                out_lines.append(f"      dropout: {PAIR_MLP_DROPOUT}")
+                out_lines.append(f"      act: '{PAIR_MLP_ACT}'")
+                out_lines.append(f"      share_across_layers: {str(PAIR_MLP_SHARE_ACROSS_LAYERS)}")
             in_attn_block = False
         out_lines.append(line)
 
     # If attn: was the last block and we never injected, append now.
-    if in_attn_block and D_STRUCT is not None and not d_struct_injected:
-        out_lines.append(f"    d_struct: {int(D_STRUCT)}")
+    if in_attn_block:
+        if D_STRUCT is not None and not d_struct_injected:
+            out_lines.append(f"    d_struct: {int(D_STRUCT)}")
+        if MODEL_VARIANT == "rope_pair":
+            out_lines.append("    edge_mlp:")
+            out_lines.append(f"      hidden_mult: {PAIR_MLP_HIDDEN_MULT}")
+            out_lines.append(f"      dropout: {PAIR_MLP_DROPOUT}")
+            out_lines.append(f"      act: '{PAIR_MLP_ACT}'")
+            out_lines.append(f"      share_across_layers: {str(PAIR_MLP_SHARE_ACROSS_LAYERS)}")
 
     # Override a few top-level fields by appending (YACS lets later keys
     # override earlier ones, but YAML doesn't -- so instead we rewrite in place).
@@ -404,8 +467,12 @@ def build_config(cfg_out_path: str):
         f.write(content)
 
     print(f"[config] Wrote derived config to {cfg_out_path}")
-    print(f"[config] layer_type=GritRoPETransformer, max_epoch={epochs}, "
-          f"seed={SEED}, d_struct={D_STRUCT}")
+    print(f"[config] variant={MODEL_VARIANT}, class={class_name}, "
+          f"max_epoch={epochs}, seed={SEED}, d_struct={D_STRUCT}")
+    if MODEL_VARIANT == "rope_pair":
+        print(f"[config] edge_mlp: hidden_mult={PAIR_MLP_HIDDEN_MULT}, "
+              f"share_across_layers={PAIR_MLP_SHARE_ACROSS_LAYERS}, "
+              f"dropout={PAIR_MLP_DROPOUT}, act={PAIR_MLP_ACT}")
     print("[config] --- begin config ---")
     print(content)
     print("[config] --- end config ---")
@@ -531,12 +598,13 @@ def main():
     install_deps()
 
     cfg_path = os.path.join(
-        WORK_DIR, "configs", "GRIT", "zinc-GRIT-RRWP-rope.yaml"
+        WORK_DIR, "configs", "GRIT", f"zinc-GRIT-RRWP-{MODEL_VARIANT}.yaml"
     )
     build_config(cfg_path)
     run_training(cfg_path)
     summarise_results()
-    print("\n[done] All finished. Check OUT_DIR for checkpoints and full logs:")
+    print(f"\n[done] All finished (variant={MODEL_VARIANT}). "
+          "Check OUT_DIR for checkpoints and full logs:")
     print(f"       {OUT_DIR}")
 
 

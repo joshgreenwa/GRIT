@@ -63,6 +63,8 @@ class MultiHeadAttentionLayerGritRoPE(nn.Module):
                  clamp=5., dropout=0.,
                  d_struct_ratio=0.75,
                  ksteps=None,
+                 compute_edge_update=True,
+                 use_edge_bias=True,
                  cfg=CN(),
                  **kwargs):
         super().__init__()
@@ -73,6 +75,16 @@ class MultiHeadAttentionLayerGritRoPE(nn.Module):
         self.num_heads = num_heads
         self.dropout = nn.Dropout(dropout)
         self.clamp = np.abs(clamp) if clamp is not None else None
+        # When False, the attention module computes the logit and value
+        # aggregation only; it does NOT touch the edge stream (`self.E` is not
+        # constructed, and `batch.wE` is not written). The outer layer is then
+        # responsible for updating edge features -- e.g. via a pair MLP. This
+        # is the hook used by GritRoPEPairTransformerLayer.
+        self.compute_edge_update = compute_edge_update
+        # When False, the attention logit does NOT include any edge-derived
+        # scalar bias. Used by the no-edge variant (GritRoPENoEdgeTransformer)
+        # where the model relies purely on RoPE structural rotation.
+        self.use_edge_bias = use_edge_bias
 
         # --- Resolve d_sem / d_struct (d_struct must be even) ---
         # Priority: explicit cfg.attn.d_struct  >  d_struct_ratio  >  default 3/4.
@@ -97,16 +109,26 @@ class MultiHeadAttentionLayerGritRoPE(nn.Module):
         self.Q = nn.Linear(in_dim, self.d_head * num_heads, bias=True)
         self.K = nn.Linear(in_dim, self.d_head * num_heads, bias=use_bias)
         self.V = nn.Linear(in_dim, self.d_head * num_heads, bias=use_bias)
-        # GRIT edge projection, kept verbatim: feeds E_w / E_b for edge update.
-        self.E = nn.Linear(in_dim, self.d_head * num_heads * 2, bias=True)
-        # Scalar edge bias w_e: E_ij -> one scalar per head.
-        self.w_e = nn.Linear(in_dim, num_heads, bias=True)
+        # GRIT edge projection, kept verbatim: feeds E_w / E_b for the edge
+        # stream update. Only instantiated when the module owns the edge
+        # update -- otherwise we save the parameters.
+        if self.compute_edge_update:
+            self.E = nn.Linear(in_dim, self.d_head * num_heads * 2, bias=True)
+            nn.init.xavier_normal_(self.E.weight)
+        else:
+            self.E = None
+        # Scalar edge bias w_e: E_ij -> one scalar per head. Only created when
+        # the module uses edge bias in the attention logit.
+        if self.use_edge_bias:
+            self.w_e = nn.Linear(in_dim, num_heads, bias=True)
+        else:
+            self.w_e = None
 
         nn.init.xavier_normal_(self.Q.weight)
         nn.init.xavier_normal_(self.K.weight)
         nn.init.xavier_normal_(self.V.weight)
-        nn.init.xavier_normal_(self.E.weight)
-        nn.init.xavier_normal_(self.w_e.weight)
+        if self.w_e is not None:
+            nn.init.xavier_normal_(self.w_e.weight)
 
         # --- Structural rotation weights W_angles, per head ---
         # Shape: (num_heads, K, d_struct // 2). K = RRWP walk length.
@@ -159,7 +181,9 @@ class MultiHeadAttentionLayerGritRoPE(nn.Module):
 
         # --- Edge stream update (GRIT's f, unchanged) ---
         # Produces updated per-channel edge features for the next layer.
-        if batch.get("E", None) is not None:
+        # Skipped entirely when compute_edge_update=False -- in that mode the
+        # outer layer owns the edge update and we leave batch.wE unset.
+        if self.compute_edge_update and batch.get("E", None) is not None:
             E_proj = batch.E.view(-1, self.num_heads, self.d_head * 2)
             E_w = E_proj[..., :self.d_head]
             E_b = E_proj[..., self.d_head:]
@@ -220,8 +244,14 @@ class MultiHeadAttentionLayerGritRoPE(nn.Module):
         batch.V_h = V_h
 
         if batch.get("edge_attr", None) is not None:
-            batch.E = self.E(batch.edge_attr)
-            batch.e_bias = self.w_e(batch.edge_attr)  # (num_edges, H)
+            if self.compute_edge_update:
+                batch.E = self.E(batch.edge_attr)
+            else:
+                batch.E = None
+            if self.use_edge_bias:
+                batch.e_bias = self.w_e(batch.edge_attr)  # (num_edges, H)
+            else:
+                batch.e_bias = None
         else:
             batch.E = None
             batch.e_bias = None
