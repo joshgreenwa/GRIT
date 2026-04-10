@@ -71,6 +71,31 @@ the GRIT paper for ZINC 12k subset):
 #   "rope_noedge" - Pure RoPE attention, no edges at all      (GritRoPENoEdgeTransformer)
 MODEL_VARIANT = "rope"
 
+# ---- Model size ----
+# These override the base zinc-GRIT-RRWP.yaml values.
+DIM_HIDDEN = 64   # gt.dim_hidden and gnn.dim_inner (must match)
+N_HEADS = 8       # gt.n_heads
+N_LAYERS = 10     # gt.layers
+
+# ---- RoPE structural / semantic split ----
+# Fraction of each head's dimension devoted to RoPE-rotated (structural)
+# channels. The remainder is plain dot-product (semantic).
+# Must be in [0.0, 1.0]. d_struct is rounded to the nearest even int.
+#   1.0  = fully structural (all channels rotated)
+#   0.0  = fully semantic   (no rotation -- standard dot-product)
+#   0.75 = default (6 of 8 channels structural for head_dim=8)
+D_STRUCT_RATIO = 0.75
+
+# ---- Static RRWP bias MLP ----
+# Adds a small MLP that maps the initial RRWP edge encoding to a per-head
+# scalar bias, applied to every layer's attention logit. "Static" = computed
+# once from the initial edge features and reused unchanged across layers.
+# Particularly useful with "rope_noedge" to give the model pairwise structural
+# info without maintaining a full edge stream.
+USE_STATIC_RRWP_BIAS = False
+RRWP_BIAS_HIDDEN_MULT = 2    # MLP: d_edge -> hidden_mult*d_edge -> n_heads
+RRWP_BIAS_ACT = "relu"       # "relu" or "gelu"
+
 # ---- Pair-MLP settings (only used when MODEL_VARIANT == "rope_pair") ----
 # MLP architecture: 3d -> hidden_mult*d -> d.  Use 1 for no expansion (3d->d->d).
 PAIR_MLP_HIDDEN_MULT = 2
@@ -109,9 +134,10 @@ DATA_DIR = (
 )
 # Where logs, checkpoints, and final metrics get written.
 # Includes the variant name so different runs don't overwrite each other.
+_run_tag = MODEL_VARIANT + ("_bias" if USE_STATIC_RRWP_BIAS else "")
 OUT_DIR = (
-    f"/content/drive/MyDrive/GRIT/results_{MODEL_VARIANT}_zinc"
-    if USE_DRIVE_FOR_PERSISTENCE else f"/content/results_{MODEL_VARIANT}_zinc"
+    f"/content/drive/MyDrive/GRIT/results_{_run_tag}_zinc"
+    if USE_DRIVE_FOR_PERSISTENCE else f"/content/results_{_run_tag}_zinc"
 )
 
 # Random seed -- the paper reports mean over seeds 0..3. Pick one for Colab.
@@ -124,10 +150,6 @@ MAX_EPOCHS = 2000
 
 # If you want a quick smoke test, set this to True to run 5 epochs.
 SMOKE_TEST = False
-
-# Override d_struct channel split (see grit_rope_layer.py). None => 3/4 of
-# head dim, rounded down to even (default).
-D_STRUCT = None  # e.g. 6 for head_dim=8
 
 # Filled in by enter_workdir() once we detect where main.py lives inside the
 # cloned repo. Everything downstream uses this instead of CLONE_DIR directly.
@@ -377,7 +399,7 @@ def enter_workdir():
 
 def build_config(cfg_out_path: str):
     """Write a new YAML config derived from zinc-GRIT-RRWP.yaml for the
-    selected MODEL_VARIANT."""
+    selected MODEL_VARIANT, with all user-configurable overrides applied."""
     import os
 
     if MODEL_VARIANT not in _VARIANT_MAP:
@@ -391,12 +413,21 @@ def build_config(cfg_out_path: str):
     with open(base_path, "r") as f:
         base_yaml = f.read()
 
-    # We deliberately do line-level string edits rather than loading as a dict
-    # and dumping, so that comments / formatting of the original file are
-    # preserved byte-for-byte for every field we don't touch.
+    # ----- Helper: line-level replacements -----
+    def replace_scalar(text, leaf, new_value):
+        """Replace the first occurrence of ``<indent><leaf>: <old>``."""
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith(f"{leaf}:"):
+                indent = ln[: len(ln) - len(ln.lstrip())]
+                lines[i] = f"{indent}{leaf}: {new_value}"
+                return "\n".join(lines) + "\n"
+        raise KeyError(f"Could not find key '{leaf}' in config")
+
+    # ----- Pass 1: line-level edits (preserve formatting) -----
     out_lines = []
     in_attn_block = False
-    d_struct_injected = False
+    extras_injected = False
 
     for line in base_yaml.splitlines():
         stripped = line.rstrip()
@@ -411,64 +442,49 @@ def build_config(cfg_out_path: str):
             out_lines.append(f"  type: {class_name}")
             continue
 
-        # Track the attn: block so we can inject d_struct and edge_mlp inside it.
+        # Track the attn: block so we can append extra sub-blocks inside it.
         if stripped.startswith("  attn:"):
             in_attn_block = True
             out_lines.append(line)
             continue
         if in_attn_block and line and not line.startswith("    ") and not line.startswith("\t"):
-            # Exiting the attn: block -- inject d_struct + edge_mlp before we leave.
-            if D_STRUCT is not None and not d_struct_injected:
-                out_lines.append(f"    d_struct: {int(D_STRUCT)}")
-                d_struct_injected = True
-            if MODEL_VARIANT == "rope_pair":
-                out_lines.append("    edge_mlp:")
-                out_lines.append(f"      hidden_mult: {PAIR_MLP_HIDDEN_MULT}")
-                out_lines.append(f"      dropout: {PAIR_MLP_DROPOUT}")
-                out_lines.append(f"      act: '{PAIR_MLP_ACT}'")
-                out_lines.append(f"      share_across_layers: {str(PAIR_MLP_SHARE_ACROSS_LAYERS)}")
+            # Exiting the attn: block -- inject our custom sub-keys.
+            _inject_attn_extras(out_lines)
+            extras_injected = True
             in_attn_block = False
         out_lines.append(line)
 
-    # If attn: was the last block and we never injected, append now.
-    if in_attn_block:
-        if D_STRUCT is not None and not d_struct_injected:
-            out_lines.append(f"    d_struct: {int(D_STRUCT)}")
-        if MODEL_VARIANT == "rope_pair":
-            out_lines.append("    edge_mlp:")
-            out_lines.append(f"      hidden_mult: {PAIR_MLP_HIDDEN_MULT}")
-            out_lines.append(f"      dropout: {PAIR_MLP_DROPOUT}")
-            out_lines.append(f"      act: '{PAIR_MLP_ACT}'")
-            out_lines.append(f"      share_across_layers: {str(PAIR_MLP_SHARE_ACROSS_LAYERS)}")
+    # If attn: was the last block:
+    if in_attn_block and not extras_injected:
+        _inject_attn_extras(out_lines)
 
-    # Override a few top-level fields by appending (YACS lets later keys
-    # override earlier ones, but YAML doesn't -- so instead we rewrite in place).
     content = "\n".join(out_lines) + "\n"
 
-    def replace_scalar(text, key_path, new_value):
-        # key_path like "optim.max_epoch" -> find "  max_epoch: <old>" under optim:
-        # Simple line replacement keyed on the leaf.
-        leaf = key_path.split(".")[-1]
-        lines = text.splitlines()
-        for i, ln in enumerate(lines):
-            if ln.strip().startswith(f"{leaf}:"):
-                indent = ln[: len(ln) - len(ln.lstrip())]
-                lines[i] = f"{indent}{leaf}: {new_value}"
-                return "\n".join(lines) + "\n"
-        raise KeyError(f"Could not find key {key_path} in config")
-
+    # ----- Pass 2: scalar overrides -----
     epochs = 5 if SMOKE_TEST else MAX_EPOCHS
-    content = replace_scalar(content, "optim.max_epoch", epochs)
-    # Write out_dir into the yaml so main.py respects it.
+    content = replace_scalar(content, "max_epoch", epochs)
     content = replace_scalar(content, "out_dir", OUT_DIR)
+    content = replace_scalar(content, "dim_hidden", DIM_HIDDEN)
+    content = replace_scalar(content, "n_heads", N_HEADS)
+    # gt.layers -- careful: the leaf "layers" also appears under gnn.
+    # We do a targeted replace inside the "gt:" section.
+    content = _replace_gt_layers(content, N_LAYERS)
+    # gnn.dim_inner must match gt.dim_hidden.
+    content = replace_scalar(content, "dim_inner", DIM_HIDDEN)
 
     os.makedirs(os.path.dirname(cfg_out_path), exist_ok=True)
     with open(cfg_out_path, "w") as f:
         f.write(content)
 
+    # ----- Summary -----
     print(f"[config] Wrote derived config to {cfg_out_path}")
-    print(f"[config] variant={MODEL_VARIANT}, class={class_name}, "
-          f"max_epoch={epochs}, seed={SEED}, d_struct={D_STRUCT}")
+    print(f"[config] variant={MODEL_VARIANT}, class={class_name}")
+    print(f"[config] dim_hidden={DIM_HIDDEN}, n_heads={N_HEADS}, "
+          f"layers={N_LAYERS}, d_struct_ratio={D_STRUCT_RATIO}")
+    print(f"[config] max_epoch={epochs}, seed={SEED}")
+    print(f"[config] static_rrwp_bias={USE_STATIC_RRWP_BIAS}"
+          + (f" (hidden_mult={RRWP_BIAS_HIDDEN_MULT}, act={RRWP_BIAS_ACT})"
+             if USE_STATIC_RRWP_BIAS else ""))
     if MODEL_VARIANT == "rope_pair":
         print(f"[config] edge_mlp: hidden_mult={PAIR_MLP_HIDDEN_MULT}, "
               f"share_across_layers={PAIR_MLP_SHARE_ACROSS_LAYERS}, "
@@ -476,6 +492,45 @@ def build_config(cfg_out_path: str):
     print("[config] --- begin config ---")
     print(content)
     print("[config] --- end config ---")
+
+
+def _inject_attn_extras(out_lines):
+    """Append extra sub-keys into the gt.attn: block."""
+    # d_struct_ratio (always injected so the attention module sees it)
+    out_lines.append(f"    d_struct_ratio: {D_STRUCT_RATIO}")
+
+    # Static RRWP bias MLP
+    if USE_STATIC_RRWP_BIAS:
+        out_lines.append("    rrwp_bias:")
+        out_lines.append("      enable: True")
+        out_lines.append(f"      hidden_mult: {RRWP_BIAS_HIDDEN_MULT}")
+        out_lines.append(f"      act: '{RRWP_BIAS_ACT}'")
+
+    # Pair-MLP (only for rope_pair)
+    if MODEL_VARIANT == "rope_pair":
+        out_lines.append("    edge_mlp:")
+        out_lines.append(f"      hidden_mult: {PAIR_MLP_HIDDEN_MULT}")
+        out_lines.append(f"      dropout: {PAIR_MLP_DROPOUT}")
+        out_lines.append(f"      act: '{PAIR_MLP_ACT}'")
+        out_lines.append(f"      share_across_layers: {str(PAIR_MLP_SHARE_ACROSS_LAYERS)}")
+
+
+def _replace_gt_layers(content, n_layers):
+    """Replace ``layers: N`` specifically inside the gt: block (not gnn:)."""
+    lines = content.splitlines()
+    in_gt = False
+    for i, ln in enumerate(lines):
+        if ln.rstrip() == "gt:":
+            in_gt = True
+            continue
+        if in_gt and ln and not ln[0].isspace():
+            # Left the gt: block without finding it.
+            break
+        if in_gt and ln.strip().startswith("layers:"):
+            indent = ln[: len(ln) - len(ln.lstrip())]
+            lines[i] = f"{indent}layers: {n_layers}"
+            return "\n".join(lines) + "\n"
+    raise KeyError("Could not find 'layers' inside gt: block")
 
 
 # ============================================================================

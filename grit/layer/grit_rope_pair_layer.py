@@ -51,7 +51,9 @@ from torch_geometric.graphgym.register import (register_layer,
 from yacs.config import CfgNode as CN
 
 from grit.layer.grit_layer import get_log_deg
-from grit.layer.grit_rope_layer import MultiHeadAttentionLayerGritRoPE
+from grit.layer.grit_rope_layer import (MultiHeadAttentionLayerGritRoPE,
+                                         StaticRRWPBiasMLP,
+                                         StaticRRWPBiasComputer)
 
 
 # --------------------------------------------------------------------------
@@ -387,6 +389,17 @@ class GritRoPEPairTransformer(nn.Module):
                 add_node_attr_as_self_loop=False,
                 fill_value=0.,
             )
+
+        # --- Optional static RRWP bias MLP ---
+        rrwp_bias_cfg = cfg.gt.attn.get("rrwp_bias", CN())
+        if rrwp_bias_cfg.get("enable", False):
+            bias_mlp = StaticRRWPBiasMLP(
+                d_edge=cfg.gnn.dim_edge,
+                n_heads=cfg.gt.n_heads,
+                hidden_mult=int(rrwp_bias_cfg.get("hidden_mult", 2)),
+                act=rrwp_bias_cfg.get("act", "relu"),
+            )
+            self.static_rrwp_bias = StaticRRWPBiasComputer(bias_mlp)
 
         if cfg.gnn.layers_pre_mp > 0:
             self.pre_mp = GNNPreMP(dim_in, cfg.gnn.dim_inner,

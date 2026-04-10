@@ -34,11 +34,78 @@ import torch_geometric as pyg
 from torch_scatter import scatter
 
 from torch_geometric.graphgym.config import cfg as global_cfg
-from torch_geometric.graphgym.register import register_layer, act_dict
+from torch_geometric.graphgym.models.gnn import GNNPreMP
+from torch_geometric.graphgym.models.layer import (new_layer_config,
+                                                   BatchNorm1dNode)
+import torch_geometric.graphgym.register as register
+from torch_geometric.graphgym.register import (register_layer,
+                                                register_network,
+                                                act_dict)
 
 from yacs.config import CfgNode as CN
 
 from grit.layer.grit_layer import pyg_softmax, get_log_deg
+
+
+# --------------------------------------------------------------------------
+# Static RRWP bias MLP -- shared across all RoPE variants
+# --------------------------------------------------------------------------
+
+class StaticRRWPBiasMLP(nn.Module):
+    """Maps initial RRWP-encoded edge features to per-head scalar biases.
+
+    Computed ONCE per forward pass from the edge features right after the
+    RRWP encoder (before any transformer layers). The biases are then added
+    to the attention logit in every layer -- they are "static" in the sense
+    that they don't evolve with the edge stream.
+
+    Architecture: Linear(d_edge, h*d_edge) -> act -> Linear(h*d_edge, n_heads)
+
+    Output projection is zero-initialised so the model starts with no bias
+    (equivalent to the no-bias baseline).
+    """
+
+    def __init__(self, d_edge: int, n_heads: int, hidden_mult: int = 2,
+                 act: str = "relu"):
+        super().__init__()
+        hidden = hidden_mult * d_edge
+        self.fc1 = nn.Linear(d_edge, hidden)
+        if act == "gelu":
+            self.act = nn.GELU()
+        else:
+            self.act = nn.ReLU()
+        self.fc2 = nn.Linear(hidden, n_heads)
+
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        # Zero-init output so training starts from no-bias baseline.
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        """edge_attr: (E, d_edge) -> (E, n_heads)."""
+        x = self.fc1(edge_attr)
+        x = self.act(x)
+        return self.fc2(x)
+
+
+class StaticRRWPBiasComputer(nn.Module):
+    """Batch-level wrapper around StaticRRWPBiasMLP.
+
+    Designed to be registered as a child of the network so it runs in the
+    ``for module in self.children(): batch = module(batch)`` loop, right
+    after the RRWP encoder.  Stores the result as ``batch.static_rrwp_bias``
+    (shape: num_edges x n_heads).
+    """
+
+    def __init__(self, mlp: StaticRRWPBiasMLP):
+        super().__init__()
+        self.mlp = mlp
+
+    def forward(self, batch):
+        if batch.get("edge_attr", None) is not None:
+            batch.static_rrwp_bias = self.mlp(batch.edge_attr)
+        return batch
 
 
 def _apply_rotation(x, cos_a, sin_a):
@@ -175,6 +242,10 @@ class MultiHeadAttentionLayerGritRoPE(nn.Module):
         # --- Scalar edge bias from the edge stream ---
         if batch.get("e_bias", None) is not None:
             logit = logit + batch.e_bias  # (E, H)
+
+        # --- Static RRWP bias (computed once in the network, reused every layer) ---
+        if batch.get("static_rrwp_bias", None) is not None:
+            logit = logit + batch.static_rrwp_bias  # (E, H)
 
         if self.clamp is not None:
             logit = torch.clamp(logit, min=-self.clamp, max=self.clamp)
@@ -429,3 +500,116 @@ class GritRoPETransformerLayer(nn.Module):
             self.in_channels, self.out_channels, self.num_heads,
             self.attention.d_sem, self.attention.d_struct, self.residual,
         )
+
+
+# --------------------------------------------------------------------------
+# Network class for the "rope" variant
+# --------------------------------------------------------------------------
+
+class _FeatureEncoder(nn.Module):
+    """Same as FeatureEncoder in grit_model.py (duplicated to avoid
+    importing a private symbol from the network module)."""
+
+    def __init__(self, dim_in):
+        super().__init__()
+        self.dim_in = dim_in
+        cfg = global_cfg
+        if cfg.dataset.node_encoder:
+            NodeEncoder = register.node_encoder_dict[cfg.dataset.node_encoder_name]
+            self.node_encoder = NodeEncoder(cfg.gnn.dim_inner)
+            if cfg.dataset.node_encoder_bn:
+                self.node_encoder_bn = BatchNorm1dNode(
+                    new_layer_config(cfg.gnn.dim_inner, -1, -1,
+                                     has_act=False, has_bias=False, cfg=cfg))
+            self.dim_in = cfg.gnn.dim_inner
+        if cfg.dataset.edge_encoder:
+            if 'PNA' in cfg.gt.layer_type:
+                cfg.gnn.dim_edge = min(128, cfg.gnn.dim_inner)
+            else:
+                cfg.gnn.dim_edge = cfg.gnn.dim_inner
+            EdgeEncoder = register.edge_encoder_dict[cfg.dataset.edge_encoder_name]
+            self.edge_encoder = EdgeEncoder(cfg.gnn.dim_edge)
+            if cfg.dataset.edge_encoder_bn:
+                self.edge_encoder_bn = BatchNorm1dNode(
+                    new_layer_config(cfg.gnn.dim_edge, -1, -1,
+                                     has_act=False, has_bias=False, cfg=cfg))
+
+    def forward(self, batch):
+        for module in self.children():
+            batch = module(batch)
+        return batch
+
+
+@register_network("GritRoPETransformer")
+class GritRoPETransformer(nn.Module):
+    """GRIT architecture with RoPE attention + GRIT-style edge stream.
+
+    This is functionally equivalent to using the original ``GritTransformer``
+    network with ``layer_type: GritRoPETransformer``, but having a dedicated
+    network class allows us to optionally inject a ``StaticRRWPBiasComputer``
+    into the forward pipeline.
+    """
+
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        cfg = global_cfg
+
+        self.encoder = _FeatureEncoder(dim_in)
+        dim_in = self.encoder.dim_in
+
+        if cfg.posenc_RRWP.enable:
+            self.rrwp_abs_encoder = register.node_encoder_dict["rrwp_linear"](
+                cfg.posenc_RRWP.ksteps, cfg.gnn.dim_inner)
+            rel_pe_dim = cfg.posenc_RRWP.ksteps
+            self.rrwp_rel_encoder = register.edge_encoder_dict["rrwp_linear"](
+                rel_pe_dim, cfg.gnn.dim_edge,
+                pad_to_full_graph=cfg.gt.attn.full_attn,
+                add_node_attr_as_self_loop=False,
+                fill_value=0.,
+            )
+
+        # --- Optional static RRWP bias MLP ---
+        rrwp_bias_cfg = cfg.gt.attn.get("rrwp_bias", CN())
+        if rrwp_bias_cfg.get("enable", False):
+            bias_mlp = StaticRRWPBiasMLP(
+                d_edge=cfg.gnn.dim_edge,
+                n_heads=cfg.gt.n_heads,
+                hidden_mult=int(rrwp_bias_cfg.get("hidden_mult", 2)),
+                act=rrwp_bias_cfg.get("act", "relu"),
+            )
+            self.static_rrwp_bias = StaticRRWPBiasComputer(bias_mlp)
+
+        if cfg.gnn.layers_pre_mp > 0:
+            self.pre_mp = GNNPreMP(dim_in, cfg.gnn.dim_inner,
+                                   cfg.gnn.layers_pre_mp)
+            dim_in = cfg.gnn.dim_inner
+
+        assert cfg.gt.dim_hidden == cfg.gnn.dim_inner == dim_in, \
+            "The inner and hidden dims must match."
+
+        TransformerLayer = register.layer_dict.get("GritRoPETransformer")
+        layers = []
+        for _ in range(cfg.gt.layers):
+            layers.append(TransformerLayer(
+                in_dim=cfg.gt.dim_hidden,
+                out_dim=cfg.gt.dim_hidden,
+                num_heads=cfg.gt.n_heads,
+                dropout=cfg.gt.dropout,
+                act=cfg.gnn.act,
+                attn_dropout=cfg.gt.attn_dropout,
+                layer_norm=cfg.gt.layer_norm,
+                batch_norm=cfg.gt.batch_norm,
+                residual=True,
+                norm_e=cfg.gt.attn.norm_e,
+                O_e=cfg.gt.attn.O_e,
+                cfg=cfg.gt,
+            ))
+        self.layers = nn.Sequential(*layers)
+
+        GNNHead = register.head_dict[cfg.gnn.head]
+        self.post_mp = GNNHead(dim_in=cfg.gnn.dim_inner, dim_out=dim_out)
+
+    def forward(self, batch):
+        for module in self.children():
+            batch = module(batch)
+        return batch
